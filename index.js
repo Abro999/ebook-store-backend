@@ -8,6 +8,7 @@ const nodemailer = require("nodemailer");
 const Razorpay = require("razorpay");
 const { nanoid } = require("nanoid");
 const db = require("./db");
+const products = require("./products");
 
 const app = express();
 app.use(cors({ origin: process.env.FRONTEND_URL || "*" }));
@@ -18,27 +19,37 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
-const PRICE_PAISE = Number(process.env.PRODUCT_PRICE_PAISE || 59900);
-const CURRENCY = process.env.PRODUCT_CURRENCY || "INR";
 const EXPIRY_HOURS = Number(process.env.DOWNLOAD_LINK_EXPIRY_HOURS || 72);
 const MAX_USES = Number(process.env.DOWNLOAD_MAX_USES || 5);
-const FILE_PATH = path.join(__dirname, "private-files", process.env.PRODUCT_FILE_NAME || "");
 
 /* ------------------------------------------------------------
-   1) Create a Razorpay order.
-   Frontend calls this first, before opening the Razorpay popup.
-   Amount is decided by the SERVER, never trust a price sent
-   from the browser — otherwise anyone could pay ₹1 for the book.
+   1) Create a Razorpay order for a specific product.
+   The price always comes from products.js on the SERVER —
+   never from the browser, so nobody can pay less than intended.
 ------------------------------------------------------------ */
 app.post("/api/orders", async (req, res) => {
   try {
-    const { email } = req.body;
+    const { email, productId } = req.body;
+    const product = products.find((p) => p.id === productId);
+    if (!product) return res.status(400).json({ error: "Unknown product" });
+
     const order = await razorpay.orders.create({
-      amount: PRICE_PAISE,
-      currency: CURRENCY,
+      amount: product.pricePaise,
+      currency: product.currency,
       receipt: `receipt_${Date.now()}`,
-      notes: { email: email || "" },
+      notes: { email: email || "", productId },
     });
+
+    // Remember which product this order was for, BEFORE payment happens.
+    // This is what verification will trust later — not anything the
+    // browser claims after the fact.
+    db.saveOrder({
+      razorpayOrderId: order.id,
+      email,
+      productId,
+      paidAt: null,
+    });
+
     res.json({
       orderId: order.id,
       amount: order.amount,
@@ -53,9 +64,6 @@ app.post("/api/orders", async (req, res) => {
 
 /* ------------------------------------------------------------
    2) Verify the payment after Razorpay's checkout popup succeeds.
-   This signature check is the ONLY way to trust that a payment
-   actually happened — never mark an order "paid" just because
-   the frontend says so.
 ------------------------------------------------------------ */
 app.post("/api/verify", async (req, res) => {
   try {
@@ -70,25 +78,34 @@ app.post("/api/verify", async (req, res) => {
       return res.status(400).json({ error: "Payment verification failed" });
     }
 
-    // Payment is genuine. Issue a secure, time-limited download token.
+    // Look up which product this order was for — recorded at order
+    // creation time, never trusted from the browser at this step.
+    const orderRecord = db.getOrderByRazorpayId(razorpay_order_id);
+    if (!orderRecord) return res.status(400).json({ error: "Unknown order" });
+
+    const product = products.find((p) => p.id === orderRecord.productId);
+    if (!product) return res.status(400).json({ error: "Product no longer available" });
+
     const token = nanoid(32);
-    const record = {
+    db.saveDownloadToken({
       token,
-      email: email || "",
+      email: email || orderRecord.email || "",
+      productId: product.id,
+      fileName: product.fileName,
       razorpayOrderId: razorpay_order_id,
       razorpayPaymentId: razorpay_payment_id,
       createdAt: Date.now(),
       expiresAt: Date.now() + EXPIRY_HOURS * 60 * 60 * 1000,
       usesCount: 0,
       maxUses: MAX_USES,
-    };
-    db.saveDownloadToken(record);
-    db.saveOrder({ razorpayOrderId: razorpay_order_id, email, paidAt: Date.now() });
+    });
+
+    db.saveOrder({ ...orderRecord, paidAt: Date.now() });
 
     const downloadUrl = `${req.protocol}://${req.get("host")}/api/download/${token}`;
 
     if (email) {
-      sendDownloadEmail(email, downloadUrl).catch((e) =>
+      sendDownloadEmail(email, downloadUrl, product.name).catch((e) =>
         console.error("Email send failed (order still succeeded):", e)
       );
     }
@@ -101,10 +118,8 @@ app.post("/api/verify", async (req, res) => {
 });
 
 /* ------------------------------------------------------------
-   3) Secure download endpoint.
-   The actual file lives OUTSIDE any publicly served folder.
-   This is the only route that can serve it, and only with a
-   valid, unexpired, not-overused token.
+   3) Secure download endpoint — works for any product, based on
+   what was recorded in the token itself.
 ------------------------------------------------------------ */
 app.get("/api/download/:token", (req, res) => {
   const record = db.getDownloadToken(req.params.token);
@@ -112,16 +127,34 @@ app.get("/api/download/:token", (req, res) => {
   if (!record) return res.status(404).send("Invalid or unknown download link.");
   if (Date.now() > record.expiresAt) return res.status(410).send("This download link has expired.");
   if (record.usesCount >= record.maxUses) return res.status(429).send("This download link has been used too many times.");
-  if (!fs.existsSync(FILE_PATH)) return res.status(500).send("File not found on server. Contact support.");
+
+  const filePath = path.join(__dirname, "private-files", record.fileName);
+  if (!fs.existsSync(filePath)) return res.status(500).send("File not found on server. Contact support.");
 
   db.incrementTokenUse(req.params.token);
-  res.download(FILE_PATH, process.env.PRODUCT_FILE_NAME);
+  res.download(filePath, record.fileName);
+});
+
+/* ------------------------------------------------------------
+   4) Public product list — lets any future frontend ask
+   "what books are for sale and at what price?" without
+   hardcoding prices into the website itself.
+------------------------------------------------------------ */
+app.get("/api/products", (req, res) => {
+  res.json(
+    products.map((p) => ({
+      id: p.id,
+      name: p.name,
+      price: p.pricePaise / 100,
+      currency: p.currency,
+    }))
+  );
 });
 
 /* ------------------------------------------------------------
    Email delivery
 ------------------------------------------------------------ */
-async function sendDownloadEmail(toEmail, downloadUrl) {
+async function sendDownloadEmail(toEmail, downloadUrl, productName) {
   const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port: Number(process.env.SMTP_PORT || 465),
@@ -132,7 +165,7 @@ async function sendDownloadEmail(toEmail, downloadUrl) {
   await transporter.sendMail({
     from: process.env.SMTP_FROM,
     to: toEmail,
-    subject: `Your download: ${process.env.PRODUCT_NAME}`,
+    subject: `Your download: ${productName}`,
     html: `
       <p>Thank you for your purchase!</p>
       <p><a href="${downloadUrl}">Click here to download your ebook</a></p>
@@ -142,9 +175,6 @@ async function sendDownloadEmail(toEmail, downloadUrl) {
   });
 }
 
-/* ------------------------------------------------------------
-   Health check (useful when deploying, to confirm it's alive)
------------------------------------------------------------- */
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 4000;
